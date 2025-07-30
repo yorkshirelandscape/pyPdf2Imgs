@@ -30,8 +30,12 @@ A modern, user-friendly tool for extracting and saving images from PDF files usi
    ```sh
    pip install pipenv
    pipenv install
-   **if using pipenv and vscode, I recommend setting the VENV_IN_PROJECT environment variable to true and telling vscode to use the pipenv environment, otherwise there's `pipenv shell`**
    ```
+   *If using pipenv and vscode, I recommend setting the VENV_IN_PROJECT environment variable to true and telling vscode to use the pipenv environment, otherwise there's*
+   ```sh
+   pipenv run python main.py
+   ```
+
 
 ## Usage
 1. Run the application:
