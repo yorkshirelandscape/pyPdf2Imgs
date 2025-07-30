@@ -11,7 +11,7 @@ import hashlib
 
 # --- CONFIG ---
 MUTOOL = 'mutool'
-DEBUG = True  # Set to True to use a persistent directory for debugging
+DEBUG = False  # Set to True to use a persistent directory for debugging
 
 # --- Map object numbers to metadata and collect image file info ---
 def get_image_files_with_metadata(img_dir, images):
@@ -408,7 +408,7 @@ def main():
                     if hamming_distance(h1, h2) <= threshold:
                         group.append((area2, img2, j))
                         used.add(j)
-                group.sort(reverse=True)
+                group.sort(key=lambda x: x[0], reverse=True)
                 kept.append(group[0][1])
                 used.add(i)
             imgs_with_meta = kept
