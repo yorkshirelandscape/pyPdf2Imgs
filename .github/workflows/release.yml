@@ -33,6 +33,13 @@ jobs:
         with:
           directory: dist
           filename: "PyPdf2Imgs-macos.zip"
+          # -y: store symlinks as symlinks. Without it, plain `zip -r` (this
+          # action's default) dereferences them, turning the .app bundle's
+          # Contents/Resources/* symlinks into full duplicate copies of
+          # Contents/Frameworks/*. That doubles the archive size and, worse,
+          # corrupts the bundle layout Qt expects when resolving its own
+          # paths at startup, causing a segfault in QLibraryInfo on launch.
+          custom: "-y"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
