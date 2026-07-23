@@ -9,15 +9,56 @@ from PIL import Image, ImageChops
 
 MUTOOL = 'mutool'
 
+# GUI apps launched from Finder/Explorer (as opposed to a terminal) don't
+# inherit the shell's PATH, so a plain subprocess.run(['mutool', ...]) can
+# fail even when mutool is properly installed. Fall back to the locations
+# common package managers actually use.
+MUTOOL_FALLBACK_PATHS = [
+    '/opt/homebrew/bin/mutool',        # Homebrew, Apple Silicon
+    '/usr/local/bin/mutool',           # Homebrew, Intel Mac / common Linux
+    '/opt/local/bin/mutool',           # MacPorts
+    '/usr/bin/mutool',                 # Linux distro packages
+    '/snap/bin/mutool',                # Linux snap packages
+    r'C:\Program Files\mupdf\mutool.exe',
+    r'C:\Program Files (x86)\mupdf\mutool.exe',
+]
+
+
+class MutoolNotFoundError(RuntimeError):
+    pass
+
+
+def find_mutool():
+    found = shutil.which(MUTOOL)
+    if found:
+        return found
+    for path in MUTOOL_FALLBACK_PATHS:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _resolve_mutool():
+    path = find_mutool()
+    if not path:
+        raise MutoolNotFoundError(
+            "Could not find 'mutool'. Install MuPDF tools (e.g. 'brew install "
+            "mupdf-tools' on macOS, 'apt install mupdf-tools' on Linux, or "
+            "download from https://mupdf.com/downloads/ on Windows)."
+        )
+    return path
+
 
 def run_mutool_info(pdf_path):
-    result = subprocess.run([MUTOOL, 'info', '-I', pdf_path], capture_output=True, text=True)
+    mutool = _resolve_mutool()
+    result = subprocess.run([mutool, 'info', '-I', pdf_path], capture_output=True, text=True)
     return result.stdout
 
 
 def run_mutool_extract(pdf_path, outdir):
+    mutool = _resolve_mutool()
     pdf_path = os.path.abspath(pdf_path)
-    cmd = [MUTOOL, 'extract', pdf_path]
+    cmd = [mutool, 'extract', pdf_path]
     return subprocess.run(cmd, cwd=outdir, capture_output=True, text=True)
 
 

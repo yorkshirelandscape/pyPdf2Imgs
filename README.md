@@ -22,6 +22,10 @@ A modern, user-friendly tool for extracting and saving images from PDF files usi
 2. Install [mutool](https://mupdf.com/downloads/) for your platform and ensure it is available in your PATH:
    - **macOS:** `brew install mupdf-tools`
    - **Windows/Linux:** download from [mupdf.com](https://mupdf.com/downloads/), or use your package manager (e.g. `sudo apt install mupdf-tools`)
+3. **macOS only:** since the app isn't signed with a paid Apple Developer ID, Gatekeeper will flag it as coming from an unidentified developer (or warn that it "could damage your computer") the first time you open it. To clear that, run this in Terminal after unzipping:
+   ```sh
+   xattr -cr PyPdf2Imgs.app
+   ```
 
 ## Usage
 1. Run the application.
@@ -48,7 +52,8 @@ A modern, user-friendly tool for extracting and saving images from PDF files usi
 ### Build your own executable
 1. Install dev dependencies: `pipenv install --dev`
 2. Build with PyInstaller, bundling the spinner asset:
-   - **macOS/Linux:** `pipenv run pyinstaller --onefile --windowed --name PyPdf2Imgs --add-data "spinner.gif:." main.py`
+   - **macOS:** `pipenv run pyinstaller --windowed --name PyPdf2Imgs --add-data "spinner.gif:." main.py` (onedir, not onefile — PyInstaller deprecates combining `--onefile` with a `--windowed` .app bundle on macOS)
+   - **Linux:** `pipenv run pyinstaller --onefile --windowed --name PyPdf2Imgs --add-data "spinner.gif:." main.py`
    - **Windows:** `pipenv run pyinstaller --onefile --windowed --name PyPdf2Imgs --add-data "spinner.gif;." main.py`
 3. Find the executable in `dist/`.
 
