@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import tempfile
+import platform
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QMovie, QPixmap, QCursor, QPalette, QColor
@@ -21,6 +22,24 @@ SCRIPT_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))
 SPINNER_PATH = os.path.join(SCRIPT_DIR, 'spinner.gif')
 THUMB_SIZE = 160
 GRID_COLS = 4
+MUPDF_DOWNLOADS_URL = 'https://mupdf.com/downloads/'
+
+
+def mutool_install_instructions():
+    """Return (instructions_text, shell_command_or_None) tailored to the
+    current OS for installing mutool."""
+    system = platform.system()
+    if system == 'Darwin':
+        return 'On macOS, install it with Homebrew:', 'brew install mupdf-tools'
+    if system == 'Windows':
+        return (
+            'On Windows, download the MuPDF tools installer below and make '
+            'sure mutool.exe ends up on your PATH.',
+            None,
+        )
+    if system == 'Linux':
+        return 'On Linux, install it with your package manager, for example:', 'sudo apt install mupdf-tools'
+    return 'Install MuPDF tools for your platform and make sure mutool is on your PATH.', None
 
 
 def pil_to_pixmap(pil_img):
@@ -114,7 +133,18 @@ class MainWindow(QMainWindow):
         self.theme_colors = {}
         self._build_ui()
         self._center_on_screen(965, 800)
+        self._check_mutool()
         QApplication.instance().styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
+
+    def _check_mutool(self):
+        found = pe.find_mutool() is not None
+        self.btn_open.setEnabled(found)
+        if found:
+            if self.stack.currentIndex() == self.MISSING_MUTOOL_INDEX:
+                self.stack.setCurrentIndex(1 if self.images else 0)
+        else:
+            self.stack.setCurrentIndex(self.MISSING_MUTOOL_INDEX)
+        return found
 
     def _is_dark_mode(self):
         scheme = QApplication.instance().styleHints().colorScheme()
@@ -242,6 +272,61 @@ class MainWindow(QMainWindow):
         spinner_layout.addWidget(self.spinner_label)
         self.stack.addWidget(spinner_page)  # index 2
 
+        # --- Missing mutool state ---
+        missing_page = QWidget()
+        missing_layout = QVBoxLayout(missing_page)
+        missing_layout.setContentsMargins(40, 0, 40, 0)
+        missing_layout.addStretch(1)
+
+        title_label = QLabel('mutool Not Found')
+        title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title_label.setStyleSheet('font-size: 18px; font-weight: 600;')
+        missing_layout.addWidget(title_label)
+
+        intro_label = QLabel(
+            "PyPdf2Imgs needs mutool (part of MuPDF) to extract images from "
+            "PDFs, but it wasn't found on your system."
+        )
+        intro_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        intro_label.setWordWrap(True)
+        missing_layout.addWidget(intro_label)
+
+        instructions_text, command = mutool_install_instructions()
+        instructions_label = QLabel(instructions_text)
+        instructions_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        instructions_label.setWordWrap(True)
+        instructions_label.setContentsMargins(0, 12, 0, 0)
+        missing_layout.addWidget(instructions_label)
+
+        if command:
+            command_label = QLabel(command)
+            command_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            command_label.setStyleSheet(
+                'font-family: monospace; background: rgba(127, 127, 127, 0.15); '
+                'padding: 6px 10px; border-radius: 4px;'
+            )
+            command_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            missing_layout.addWidget(command_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        link_label = QLabel(f'<a href="{MUPDF_DOWNLOADS_URL}">{MUPDF_DOWNLOADS_URL}</a>')
+        link_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        link_label.setOpenExternalLinks(True)
+        link_label.setContentsMargins(0, 12, 0, 0)
+        missing_layout.addWidget(link_label)
+
+        recheck_btn = QPushButton('Check Again')
+        recheck_btn.clicked.connect(self._check_mutool)
+        recheck_row = QHBoxLayout()
+        recheck_row.addStretch(1)
+        recheck_row.addWidget(recheck_btn)
+        recheck_row.addStretch(1)
+        missing_layout.addSpacing(12)
+        missing_layout.addLayout(recheck_row)
+
+        missing_layout.addStretch(1)
+        self.stack.addWidget(missing_page)  # index 3
+        self.MISSING_MUTOOL_INDEX = 3
+
         central = QWidget()
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
@@ -249,8 +334,6 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(toolbar)
         central_layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
-
-        self.stack.setCurrentIndex(0)
 
     # --- PDF opening / extraction ---
     def open_pdf(self):
