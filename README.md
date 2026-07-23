@@ -22,10 +22,12 @@ A modern, user-friendly tool for extracting and saving images from PDF files usi
 2. Install [mutool](https://mupdf.com/downloads/) for your platform and ensure it is available in your PATH:
    - **macOS:** `brew install mupdf-tools`
    - **Windows/Linux:** download from [mupdf.com](https://mupdf.com/downloads/), or use your package manager (e.g. `sudo apt install mupdf-tools`)
-3. **macOS only:** since the app isn't signed with a paid Apple Developer ID, Gatekeeper will flag it as coming from an unidentified developer (or warn that it "could damage your computer") the first time you open it. To clear that, run this in Terminal after unzipping:
-   ```sh
-   xattr -cr PyPdf2Imgs.app
-   ```
+3. **macOS only:** since the app isn't signed with a paid Apple Developer ID, Gatekeeper will flag it as coming from an unidentified developer (or warn that it "could damage your computer") the first time you open it. To clear that:
+   - **Easiest:** double-click `Fix macOS Warning.command`, included in the zip next to the app. (It'll still prompt you once, since it's also unsigned — right-click it and choose "Open" instead of double-clicking if it doesn't open normally.)
+   - **Or manually:** run this in Terminal after unzipping:
+     ```sh
+     xattr -d -r com.apple.quarantine PyPdf2Imgs.app
+     ```
 
 ## Usage
 1. Run the application.

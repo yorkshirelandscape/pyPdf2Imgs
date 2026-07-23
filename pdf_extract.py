@@ -93,6 +93,61 @@ def find_extracted_file(img_dir, obj_num):
     return matches[0] if matches else None
 
 
+_PAM_MODE_BY_TUPLTYPE = {
+    ('CMYK', 4): 'CMYK',
+    ('RGB_ALPHA', 4): 'RGBA',
+    ('RGB', 3): 'RGB',
+    ('GRAYSCALE_ALPHA', 2): 'LA',
+    ('GRAYSCALE', 1): 'L',
+    ('BLACKANDWHITE', 1): '1',
+}
+
+
+def _read_pam(path):
+    """Parse a PAM (Portable Arbitrary Map) file. mutool falls back to this
+    format when decoded pixel data doesn't fit cleanly into PNG or JPEG (e.g.
+    raw CMYK from an indexed-color image), and Pillow cannot open PAM files
+    natively."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    if not data.startswith(b'P7\n'):
+        raise ValueError(f'Not a PAM file: {path}')
+    header_end = data.index(b'ENDHDR\n') + len(b'ENDHDR\n')
+    fields = {}
+    for line in data[:header_end].decode('ascii', errors='replace').splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in ('WIDTH', 'HEIGHT', 'DEPTH', 'MAXVAL'):
+            fields[parts[0]] = int(parts[1])
+        elif len(parts) == 2 and parts[0] == 'TUPLTYPE':
+            fields['TUPLTYPE'] = parts[1]
+    width, height, depth = fields['WIDTH'], fields['HEIGHT'], fields['DEPTH']
+    tupltype = fields.get('TUPLTYPE')
+    pixel_data = data[header_end:header_end + width * height * depth]
+
+    if (tupltype, depth) == ('CMYK_ALPHA', 5):
+        # Pillow has no native 5-channel mode; split the interleaved bands
+        # (each Nth byte is one channel) and reassemble as RGBA.
+        size = (width, height)
+        c, m, y, k, a = (
+            Image.frombytes('L', size, pixel_data[i::5]) for i in range(5)
+        )
+        rgb = Image.merge('CMYK', (c, m, y, k)).convert('RGB')
+        return Image.merge('RGBA', (*rgb.split(), a))
+
+    mode = _PAM_MODE_BY_TUPLTYPE.get((tupltype, depth))
+    if mode is None:
+        raise ValueError(f"Unsupported PAM tuple type/depth: {tupltype}/{depth}")
+    return Image.frombytes(mode, (width, height), pixel_data)
+
+
+def open_extracted_image(path):
+    """Open an image file mutool produced, handling formats Pillow can't
+    read natively (currently just PAM)."""
+    if path.lower().endswith('.pam'):
+        return _read_pam(path)
+    return Image.open(path)
+
+
 def canonical_png_path(img_dir, obj_num):
     return os.path.join(img_dir, f"image-{obj_num:04d}.png")
 
@@ -112,7 +167,7 @@ def normalize_to_png(img_dir, obj_num):
             if im.mode != 'RGBA':
                 im.convert('RGBA').save(png_path)
         return png_path
-    with Image.open(src_path) as im:
+    with open_extracted_image(src_path) as im:
         im.convert('RGBA').save(png_path)
     os.remove(src_path)
     return png_path
@@ -125,10 +180,10 @@ def merge_smask_alpha(img_dir):
     files = sorted(os.listdir(img_dir))
     image_info = []
     for fname in files:
-        if fname.startswith('image-') and fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+        if fname.startswith('image-') and fname.lower().endswith(('.png', '.jpg', '.jpeg', '.pam')):
             fpath = os.path.join(img_dir, fname)
             try:
-                with Image.open(fpath) as im:
+                with open_extracted_image(fpath) as im:
                     image_info.append({'fname': fname, 'size': im.size, 'mode': im.mode, 'fpath': fpath})
             except Exception as e:
                 print(f"[WARN] Could not open {fname}: {e}")
@@ -158,9 +213,9 @@ def merge_smask_alpha(img_dir):
         rgb_path = rgb['fpath']
         mask_path = best_mask['fpath']
         try:
-            with Image.open(rgb_path) as im:
+            with open_extracted_image(rgb_path) as im:
                 im = im.convert('RGBA')
-                with Image.open(mask_path) as smask:
+                with open_extracted_image(mask_path) as smask:
                     smask = smask.convert('L')
                     if smask.size != im.size:
                         resample = getattr(Image, 'Resampling', Image).LANCZOS
@@ -238,7 +293,14 @@ def extract_images(pdf_path, outdir):
     img_files = []
     for img in images:
         obj_num = img['obj_num']
-        orig_path = normalize_to_png(outdir, obj_num)
+        try:
+            orig_path = normalize_to_png(outdir, obj_num)
+        except Exception as e:
+            # However complete our format handling is, one image mutool
+            # produces in a shape we don't recognize (or can't decode)
+            # shouldn't take down every other image in the file with it.
+            print(f"[WARN] Skipping image object {obj_num}, could not normalize: {e}")
+            continue
         if orig_path is None:
             continue
         img_files.append({

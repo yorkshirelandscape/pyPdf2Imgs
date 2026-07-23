@@ -27,6 +27,13 @@ jobs:
         # Only the .app is meant to be distributed; drop the loose one so the
         # zip isn't doubled up.
         run: rm -rf dist/PyPdf2Imgs
+      - name: Add Gatekeeper quarantine-removal helper
+        # The app isn't signed with a paid Apple Developer ID, so Gatekeeper
+        # flags it. Ship a one-click script to clear the quarantine flag
+        # instead of making users run Terminal commands themselves.
+        run: |
+          cp "packaging/macos/Fix macOS Warning.command" dist/
+          chmod +x "dist/Fix macOS Warning.command"
 
       - name: Zip artifact
         uses: thedoctor0/zip-release@0.7.6
