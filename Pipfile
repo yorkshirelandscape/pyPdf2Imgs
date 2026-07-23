@@ -5,8 +5,11 @@ name = "pypi"
 
 [packages]
 pillow = "*"
+pyqt6 = "*"
 
 [dev-packages]
+pyinstaller = "*"
+keepachangelog-manager = "*"
 
 [requires]
 python_version = "3.13"

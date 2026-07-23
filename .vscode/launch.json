@@ -11,7 +11,8 @@
         "module": "main",
         "console": "integratedTerminal",
         "justMyCode": true,
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}",
+        "python": "${workspaceFolder}/.venv/bin/python3"
       },
     ]
 }

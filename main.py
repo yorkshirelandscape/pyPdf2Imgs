@@ -1,762 +1,505 @@
 import os
-import subprocess
+import sys
 import shutil
 import tempfile
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk, ImageChops
-import re
-import threading
-import hashlib
 
-# --- CONFIG ---
-MUTOOL = 'mutool'
-DEBUG = False  # Set to True to use a persistent directory for debugging
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QMovie, QPixmap, QCursor, QPalette, QColor
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QFrame, QScrollArea, QFileDialog,
+    QMessageBox, QRadioButton, QButtonGroup, QStackedWidget, QDialog, QInputDialog,
+)
+from PIL import Image
+from PIL.ImageQt import ImageQt
 
-# --- Map object numbers to metadata and collect image file info ---
-def get_image_files_with_metadata(img_dir, images):
-    obj_map = {}
-    for img in images:
-        num = str(img['obj_num']).zfill(4)
-        obj_map[num] = img
-    img_files = []
-    for img in images:
-        obj_num = str(img['obj_num']).zfill(4)
-        meta = obj_map.get(obj_num, {})
-        thumb_path = os.path.join(img_dir, f"thumb-{obj_num}.png")
-        orig_path = os.path.join(img_dir, f"image-{obj_num}.png")  # Only extract when saving
+import pdf_extract as pe
 
-        # --- Ensure alpha channel for extracted images ---
-        if os.path.exists(orig_path):
-            try:
-                im = Image.open(orig_path)
-                if im.mode != 'RGBA':
-                    im = im.convert('RGBA')
-                    im.save(orig_path)
-            except Exception as e:
-                print(f"[WARN] Could not ensure alpha for {orig_path}: {e}")
-        img_files.append({
-            'filename': f"image-{obj_num}.png",
-            'meta': meta,
-            'orig_path': orig_path,
-            'thumb_path': thumb_path,
-        })
-    return img_files
-
-def run_mutool_info(pdf_path):
-    result = subprocess.run([MUTOOL, 'info', '-I', pdf_path], capture_output=True, text=True)
-    return result.stdout
+# PyInstaller's onefile mode extracts bundled data files to a temp dir at
+# runtime (sys._MEIPASS), not next to the script/executable.
+SCRIPT_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+SPINNER_PATH = os.path.join(SCRIPT_DIR, 'spinner.gif')
+THUMB_SIZE = 160
+GRID_COLS = 4
 
 
-def run_mutool_extract(pdf_path, outdir, image_obj_nums):
-    pdf_path = os.path.abspath(pdf_path)
-    if image_obj_nums is None:
-        cmd = [MUTOOL, 'extract', pdf_path]
-    else:
-        cmd = [MUTOOL, 'extract', pdf_path]
-        for num in image_obj_nums:
-            cmd.append(str(num))
-    print(f"[DEBUG] Extracting images to: {os.path.abspath(outdir)}")
-    result = subprocess.run(cmd, cwd=outdir)
-    print(f"[DEBUG] mutool extract stdout: {result.stdout}")
-    print(f"[DEBUG] mutool extract stderr: {result.stderr}")
-    print(f"[DEBUG] Files in extraction dir after extraction: {os.listdir(outdir)}")
-    return result
-
-def parse_image_info(info_text):
-    images = []
-    lines = info_text.splitlines()
-    in_images_section = False
-    for line in lines:
-        if line.strip().startswith('Images ('):
-            in_images_section = True
-            continue
-        if in_images_section:
-            parts = line.strip().split('\t')
-            if len(parts) < 3:
-                continue
-            page = int(parts[0])
-            page_obj = int(parts[1].strip('():').split(' ')[0])
-            dims = [p for p in parts[2].split(' ') if 'x' in p and p[0].isdigit()]
-            obj_num = int(parts[2].split('(')[1].split(' ')[0])
-            # Try to extract color space/mode info if present
-            mode = None
-            if '[ DCT' in parts[2] or '[ JPX' in parts[2]:
-                # Look for ICC, DeviceRGB, DeviceGray, etc.
-                if 'DeviceGray' in parts[2] or 'Gray' in parts[2]:
-                    mode = 'L'
-                elif 'DeviceRGB' in parts[2] or 'RGB' in parts[2]:
-                    mode = 'RGB'
-                elif 'DeviceCMYK' in parts[2] or 'CMYK' in parts[2]:
-                    mode = 'CMYK'
-            if dims:
-                width, height = [int(d) for d in dims[0].split('x')]
-            else:
-                width = height = '?'
-            images.append({'page': page, 'obj_num': obj_num, 'width': width, 'height': height, 'mode': mode})
-    return images
+def pil_to_pixmap(pil_img):
+    return QPixmap.fromImage(ImageQt(pil_img.convert('RGBA')))
 
 
+class ExtractWorker(QThread):
+    finished_ok = pyqtSignal(list)
+    no_images = pyqtSignal()
+    error = pyqtSignal(str)
 
-def merge_smask_alpha(img_dir):
-    """
-    For each image file, try to pair RGB(A) images with grayscale or non-RGB(A) images of similar size as masks.
-    Print debug info for all candidates and pairings.
-    """
-    files = sorted(os.listdir(img_dir))
-    # Gather all images with their mode and size
-    image_info = []
-    for fname in files:
-        if fname.startswith('image-') and (fname.endswith('.png') or fname.endswith('.jpg') or fname.endswith('.jpeg')):
-            fpath = os.path.join(img_dir, fname)
-            try:
-                with Image.open(fpath) as im:
-                    image_info.append({
-                        'fname': fname,
-                        'size': im.size,
-                        'mode': im.mode,
-                        'fpath': fpath
-                    })
-            except Exception as e:
-                print(f"[WARN] Could not open {fname}: {e}")
-    # Print all image info for debugging
-    print("[DEBUG] All image files:")
-    for info in image_info:
-        print(f"  {info['fname']}: mode={info['mode']}, size={info['size']}")
-    merged_count = 0
-    used_masks = set()
-    # Group by page and position if possible (using filename number as proxy)
-    def extract_obj_num(fname):
-        m = re.search(r'image-(\d+)', fname)
-        return int(m.group(1)) if m else -1
-    image_info_sorted = sorted(image_info, key=lambda x: extract_obj_num(x['fname']))
-    for i, rgb in enumerate(image_info_sorted):
-        if rgb['mode'] not in ('RGB', 'RGBA'):
-            continue
-        # Try to find a mask: next image on same page, similar size, not already used, and not RGB(A)
-        best_mask = None
-        for j in range(i+1, len(image_info_sorted)):
-            mask = image_info_sorted[j]
-            if mask['fname'] == rgb['fname'] or mask['fname'] in used_masks:
-                continue
-            if mask['mode'] in ('RGB', 'RGBA'):
-                continue
-            # Must be very close in size
-            if abs(mask['size'][0] - rgb['size'][0]) <= 2 and abs(mask['size'][1] - rgb['size'][1]) <= 2:
-                best_mask = mask
-                break
-        if best_mask:
-            rgb_path = rgb['fpath']
-            mask_path = best_mask['fpath']
-            print(f"[DEBUG] Pairing {rgb['fname']} (mode={rgb['mode']}, size={rgb['size']}) with {best_mask['fname']} (mode={best_mask['mode']}, size={best_mask['size']})")
-            try:
-                with Image.open(rgb_path) as im:
-                    im = im.convert('RGBA')
-                    with Image.open(mask_path) as smask:
-                        smask = smask.convert('L')
-                        if smask.size != im.size:
-                            try:
-                                resample = Image.Resampling.LANCZOS
-                            except AttributeError:
-                                # Pillow < 9.1.0: fallback to Image.LANCZOS or Image.NEAREST
-                                resample = getattr(Image, 'LANCZOS', getattr(Image, 'NEAREST', 0))
-                            smask = smask.resize(im.size, resample)
-                        r, g, b, _ = im.split()
-                        im_rgba = Image.merge('RGBA', (r, g, b, smask))
-                        # --- Trim after mask application ---
-                        from PIL import ImageChops
-                        def trim_transparency_local(im):
-                            if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
-                                alpha = im.convert('RGBA').split()[-1]
-                                bbox = alpha.getbbox()
-                                if bbox:
-                                    return im.crop(bbox)
-                            return im
-                        im_rgba = trim_transparency_local(im_rgba)
-                        outpath = rgb_path
-                        im_rgba.save(outpath)
-                        print(f"[INFO] Merged {rgb['fname']} + {best_mask['fname']} -> {rgb['fname']} (overwritten, trimmed)")
-                        merged_count += 1
-                        used_masks.add(best_mask['fname'])
-            except Exception as e:
-                print(f"[WARN] Failed to merge {rgb['fname']} + {best_mask['fname']}: {e}")
-    print(f"[INFO] Merged {merged_count} image+mask pairs.")
+    def __init__(self, pdf_path, outdir):
+        super().__init__()
+        self.pdf_path = pdf_path
+        self.outdir = outdir
 
-def main():
-    spinner = None
-    spinner_frames = []
-    spinner_frame_idx = 0
-    spinner_job = None
-
-    def load_spinner_gif(path='spinner.gif'):
-        # Load all frames of the GIF
-        # PIL already imported at top
-        frames = []
+    def run(self):
         try:
-            im = Image.open(path)
-            while True:
-                frames.append(ImageTk.PhotoImage(im.copy(), master=root))
-                try:
-                    im.seek(im.tell() + 1)
-                except EOFError:
-                    break
+            images = pe.extract_images(self.pdf_path, self.outdir)
         except Exception as e:
-            print(f"[WARN] Could not load spinner.gif: {e}")
-        return frames
+            self.error.emit(str(e))
+            return
+        if not images:
+            self.no_images.emit()
+            return
+        self.finished_ok.emit(images)
 
-    def show_spinner():
-        nonlocal spinner, spinner_frames, spinner_frame_idx, spinner_job
-        canvas.itemconfig(frame_id, state='hidden')
-        spinner_frames = load_spinner_gif()
-        spinner_frame_idx = 0
-        if not spinner_frames:
-            raise RuntimeError("spinner.gif not found or failed to load. Spinner is required.")
-        w = canvas.winfo_width() or 400
-        h = canvas.winfo_height() or 200
-        spinner = tk.Label(canvas, image=spinner_frames[0], borderwidth=0, highlightthickness=0, bg='white')
-        spinner.place(x=w//2, y=h//2, anchor='center')
-        def animate():
-            nonlocal spinner_frame_idx, spinner_job
-            if not spinner_frames or spinner is None:
-                return
-            spinner.config(image=spinner_frames[spinner_frame_idx])
-            spinner_frame_idx = (spinner_frame_idx + 1) % len(spinner_frames)
-            spinner_job = root.after(80, animate)  # 80ms per frame ~12.5fps
-        animate()
 
-    def clear_spinner():
-        nonlocal spinner, spinner_job
-        if spinner_job is not None:
-            root.after_cancel(spinner_job)
-            spinner_job = None
-        if spinner is not None:
-            spinner.destroy()
-            spinner = None
-        # Restore the frame to the canvas after spinner is cleared
-        canvas.itemconfig(frame_id, state='normal')
-        print('[DEBUG] clear_spinner: frame_id state set to normal')
-        print('[DEBUG] clear_spinner: canvas items:', canvas.find_all())
-        print('[DEBUG] clear_spinner: frame.winfo_manager():', frame.winfo_manager())
-        print('[DEBUG] clear_spinner: frame.winfo_ismapped():', frame.winfo_ismapped())
-        
-    root = tk.Tk()
-    root.title('PDF Image Selector')
-    win_w, win_h = 965, 800  # Increased width for more toolbar padding and radio spacing (was 950)
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = (screen_width // 2) - (win_w // 2)
-    y = (screen_height // 2) - (win_h // 2)
-    root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
 
-    # --- Open PDF logic ---
-    def open_pdf():
-        nonlocal img_files_with_meta, tmpdir
-        # Step 1: Show file dialog first (no spinner yet)
-        pdf_path = filedialog.askopenfilename(title='Select PDF file', filetypes=[('PDF files', '*.pdf')], parent=root)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class FullImageDialog(QDialog):
+    def __init__(self, parent, orig_path, meta, img_file):
+        super().__init__(parent)
+        self.setWindowTitle(f"Full Image: {img_file}")
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_w = min(1600, screen.width() - 100)
+        max_h = min(1200, screen.height() - 100)
+
+        pil_full = Image.open(orig_path)
+        img_w, img_h = pil_full.size
+        scale = min(1.0, max_w / img_w, max_h / img_h)
+        if scale < 1.0:
+            pil_disp = pil_full.resize((int(img_w * scale), int(img_h * scale)), Image.Resampling.LANCZOS)
+        else:
+            pil_disp = pil_full
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        info_label = QLabel(f"{img_file}  |  {meta.get('width', '?')} x {meta.get('height', '?')}")
+        info_label.setStyleSheet('background:#222; color:#fff; padding:4px;')
+        layout.addWidget(info_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        image_label = QLabel()
+        image_label.setPixmap(pil_to_pixmap(pil_disp))
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setWidget(image_label)
+        layout.addWidget(scroll)
+
+        self.resize(min(pil_disp.width + 40, max_w + 40), min(pil_disp.height + 80, max_h + 80))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('PDF Image Selector')
+        self.images = []
+        self.tmpdir = None
+        self.spinner_movie = None
+        self.theme_colors = {}
+        self._build_ui()
+        self._center_on_screen(965, 800)
+        QApplication.instance().styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
+
+    def _is_dark_mode(self):
+        scheme = QApplication.instance().styleHints().colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return True
+        if scheme == Qt.ColorScheme.Light:
+            return False
+        # Unknown: fall back to inspecting the actual palette we were handed.
+        return self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+    def _compute_theme_colors(self):
+        """Derive card/text colors from the live system palette instead of
+        hardcoding a light- or dark-mode assumption, so the UI tracks whatever
+        appearance the OS is actually set to (and updates if it changes)."""
+        window = self.palette().color(QPalette.ColorRole.Window)
+        text = self.palette().color(QPalette.ColorRole.WindowText)
+        if self._is_dark_mode():
+            unselected_bg = window.lighter(128)
+            unselected_border = window.lighter(165)
+            selected_bg = QColor('#123a5c')
+            selected_border = QColor('#64b5f6')
+        else:
+            unselected_bg = window.darker(107)
+            unselected_border = window.darker(120)
+            selected_bg = QColor('#e3f2fd')
+            selected_border = QColor('#1976d2')
+        secondary_text = QColor(text)
+        secondary_text.setAlpha(160)
+        return {
+            'text': text.name(),
+            'secondary_text': f'rgba({secondary_text.red()}, {secondary_text.green()}, {secondary_text.blue()}, {secondary_text.alpha()})',
+            'unselected_bg': unselected_bg.name(),
+            'unselected_border': unselected_border.name(),
+            'selected_bg': selected_bg.name(),
+            'selected_border': selected_border.name(),
+        }
+
+    def _on_color_scheme_changed(self, _scheme):
+        self.render_grid()
+
+    def _center_on_screen(self, w, h):
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = screen.x() + (screen.width() - w) // 2
+        y = screen.y() + (screen.height() - h) // 2
+        self.setGeometry(x, y, w, h)
+
+    def _build_ui(self):
+        toolbar = QWidget()
+        tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(8, 5, 12, 5)
+
+        self.btn_open = QPushButton('\U0001F4C2 Open PDF')
+        self.btn_open.setStyleSheet(
+            'background:#bbdefb; color:#0d47a1; font-weight:600; border-radius:8px; padding:4px 12px;'
+        )
+        self.btn_open.clicked.connect(self.open_pdf)
+        tb_layout.addWidget(self.btn_open)
+
+        tb_layout.addStretch(1)
+
+        self.btn_all = QPushButton('Select All')
+        self.btn_all.clicked.connect(self.select_all)
+        tb_layout.addWidget(self.btn_all)
+
+        self.btn_none = QPushButton('Select None')
+        self.btn_none.clicked.connect(self.select_none)
+        tb_layout.addWidget(self.btn_none)
+
+        tb_layout.addStretch(1)
+
+        self.rb_png = QRadioButton('PNG')
+        self.rb_png.setChecked(True)
+        self.rb_webp = QRadioButton('WEBP')
+        fmt_group = QButtonGroup(self)
+        fmt_group.addButton(self.rb_png)
+        fmt_group.addButton(self.rb_webp)
+        tb_layout.addWidget(self.rb_png)
+        tb_layout.addWidget(self.rb_webp)
+
+        self.btn_save = QPushButton('\U0001F4BE Save Selected')
+        self.btn_save.setStyleSheet('background:#43a047; border-radius:8px; padding:4px 12px;')
+        self.btn_save.clicked.connect(self.save_selected)
+        tb_layout.addWidget(self.btn_save)
+
+        self.stack = QStackedWidget()
+
+        # --- Empty state: big centered Open PDF button ---
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        big_open_btn = QPushButton('\U0001F4C2  Open PDF')
+        big_open_btn.setFixedSize(240, 80)
+        big_open_btn.setStyleSheet(
+            'font-size: 18px; background: #bbdefb; color: #0d47a1; font-weight: 600; border-radius: 8px;'
+        )
+        big_open_btn.clicked.connect(self.open_pdf)
+        hcenter = QHBoxLayout()
+        hcenter.addStretch(1)
+        hcenter.addWidget(big_open_btn)
+        hcenter.addStretch(1)
+        empty_layout.addStretch(1)
+        empty_layout.addLayout(hcenter)
+        empty_layout.addStretch(1)
+        self.stack.addWidget(empty_page)  # index 0
+
+        # --- Grid page ---
+        grid_page = QWidget()
+        grid_page_layout = QVBoxLayout(grid_page)
+        grid_page_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet('border: none;')
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setHorizontalSpacing(24)
+        self.grid_layout.setVerticalSpacing(18)
+        self.scroll_area.setWidget(self.grid_container)
+        grid_page_layout.addWidget(self.scroll_area)
+        self.stack.addWidget(grid_page)  # index 1
+
+        # --- Spinner page ---
+        spinner_page = QWidget()
+        spinner_layout = QVBoxLayout(spinner_page)
+        self.spinner_label = QLabel()
+        self.spinner_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        spinner_layout.addWidget(self.spinner_label)
+        self.stack.addWidget(spinner_page)  # index 2
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(toolbar)
+        central_layout.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+
+        self.stack.setCurrentIndex(0)
+
+    # --- PDF opening / extraction ---
+    def open_pdf(self):
+        pdf_path, _ = QFileDialog.getOpenFileName(self, 'Select PDF file', '', 'PDF files (*.pdf)')
         if not pdf_path:
             return
-        # Step 2: Now show spinner and start processing
-        show_spinner()
-        def worker():
-            nonlocal img_files_with_meta, tmpdir
-            # Step 0: Use the selected pdf_path
-            # Step 1: Read PDF Info
-            info = run_mutool_info(pdf_path)
-            images = parse_image_info(info)
-            if not images:
-                def show_no_images():
-                    clear_spinner()
-                    messagebox.showinfo('No Images', 'No images found in PDF.', parent=root)
-                root.after(0, show_no_images)
-                return
-            # Step 2: Prepare extraction dir
-            if DEBUG:
-                debug_extract_dir = os.path.abspath(os.path.join(os.getcwd(), 'debug_extracted_images'))
-                if os.path.exists(debug_extract_dir):
-                    for f in os.listdir(debug_extract_dir):
-                        fp = os.path.join(debug_extract_dir, f)
-                        try:
-                            if os.path.isfile(fp) or os.path.islink(fp):
-                                os.unlink(fp)
-                            elif os.path.isdir(fp):
-                                shutil.rmtree(fp)
-                        except Exception as e:
-                            print(f"[DEBUG] Failed to delete {fp}: {e}")
-                else:
-                    os.makedirs(debug_extract_dir)
-                tmpdir = debug_extract_dir
-            else:
-                if tmpdir and os.path.exists(tmpdir):
-                    shutil.rmtree(tmpdir)
-                tmpdir = tempfile.mkdtemp()
-            # Step 3: Extract images
-            run_mutool_extract(pdf_path, tmpdir, None)
-            # Step 4: Apply SMask
-            merge_smask_alpha(tmpdir)
-            # Step 5: Deduplicate
-            def hash_image_file(path):
-                hasher = hashlib.sha1()
-                with open(path, 'rb') as f:
-                    while True:
-                        buf = f.read(8192)
-                        if not buf:
-                            break
-                        hasher.update(buf)
-                return hasher.hexdigest()
-            def deduplicate_images(imgs):
-                seen = set()
-                unique_imgs = []
-                for img in imgs:
-                    img_path = img['orig_path']
-                    try:
-                        h = hash_image_file(img_path)
-                    except Exception:
-                        continue
-                    if h not in seen:
-                        seen.add(h)
-                        unique_imgs.append(img)
-                return unique_imgs
-            imgs_with_meta = get_image_files_with_metadata(tmpdir, images)
-            imgs_with_meta = deduplicate_images(imgs_with_meta)
-            if not imgs_with_meta:
-                def show_no_imgs_extracted():
-                    clear_spinner()
-                    messagebox.showinfo('No Images', 'No images extracted.', parent=root)
-                root.after(0, show_no_imgs_extracted)
-                return
-            # Step 6: Generate thumbnails
-            total_thumbs = len(images)
-            for i, img in enumerate(images):
-                obj_num = img.get('obj_num')
-                if not obj_num:
-                    continue
-                orig_path = os.path.join(tmpdir, f"image-{obj_num:04d}.png")
-                thumb_path = os.path.join(tmpdir, f"thumb-{obj_num:04d}.png")
-                if not os.path.exists(orig_path):
-                    continue
-                if os.path.exists(thumb_path):
-                    continue
-                try:
-                    with Image.open(orig_path) as im:
-                        def trim_whitespace(im):
-                            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-                                alpha = im.convert("RGBA").split()[-1]
-                                bbox = alpha.getbbox()
-                                if bbox:
-                                    return im.crop(bbox)
-                                else:
-                                    return im
-                            else:
-                                bg = im.getpixel((0, 0))
-                                if isinstance(bg, int):
-                                    bg = (bg,)
-                                bg_img = Image.new(im.mode, im.size, bg)
-                                diff = ImageChops.difference(im, bg_img)
-                                bbox = diff.getbbox()
-                                if bbox:
-                                    return im.crop(bbox)
-                                else:
-                                    return im
-                        im_trimmed = trim_whitespace(im)
-                        im_trimmed.thumbnail((160, 160))
-                        im_trimmed.save(thumb_path, 'PNG')
-                except Exception as e:
-                    print(f"[WARN] Failed to generate trimmed thumbnail for image {orig_path}: {e}")
-            # Step 7: Perceptual Deduplication (after all thumbs are written)
-            def ahash_image(img, hash_size=8):
-                img = img.convert('L')
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = getattr(Image, 'LANCZOS', getattr(Image, 'BICUBIC', 0))
-                img = img.resize((hash_size, hash_size), resample)
-                pixels = list(img.getdata())
-                avg = sum(pixels) / len(pixels)
-                bits = ''.join(['1' if p > avg else '0' for p in pixels])
-                return bits
-            def hamming_distance(a, b):
-                return sum(x != y for x, y in zip(a, b))
-            hash_area_img = []
-            for img in imgs_with_meta:
-                thumb_path = img.get('thumb_path')
-                orig_path = img.get('orig_path')
-                if not thumb_path or not os.path.exists(thumb_path):
-                    continue
-                try:
-                    with Image.open(thumb_path) as thumb_img:
-                        h = ahash_image(thumb_img)
-                except Exception as e:
-                    print(f"[WARN] Could not perceptual-hash thumbnail {thumb_path}: {e}")
-                    continue
-                try:
-                    with Image.open(orig_path) as orig_img:
-                        area = orig_img.width * orig_img.height
-                except Exception:
-                    area = 0
-                hash_area_img.append((h, area, img))
-            threshold = 5
-            kept = []
-            used = set()
-            for i, (h1, area1, img1) in enumerate(hash_area_img):
-                if i in used:
-                    continue
-                group = [(area1, img1, i)]
-                for j in range(i+1, len(hash_area_img)):
-                    if j in used:
-                        continue
-                    h2, area2, img2 = hash_area_img[j]
-                    if hamming_distance(h1, h2) <= threshold:
-                        group.append((area2, img2, j))
-                        used.add(j)
-                group.sort(key=lambda x: x[0], reverse=True)
-                kept.append(group[0][1])
-                used.add(i)
-            imgs_with_meta = kept
-            img_files_with_meta = imgs_with_meta
-            def finish_render():
-                clear_spinner()
-                print('[DEBUG] finish_render: after clear_spinner, before render_images')
-                print('[DEBUG] finish_render: canvas items:', canvas.find_all())
-                print('[DEBUG] finish_render: frame.winfo_manager():', frame.winfo_manager())
-                print('[DEBUG] finish_render: frame.winfo_ismapped():', frame.winfo_ismapped())
-                render_images()
-                print('[DEBUG] finish_render: after render_images')
-                print('[DEBUG] finish_render: canvas items:', canvas.find_all())
-                print('[DEBUG] finish_render: frame.winfo_manager():', frame.winfo_manager())
-                print('[DEBUG] finish_render: frame.winfo_ismapped():', frame.winfo_ismapped())
-            root.after(0, finish_render)
-        threading.Thread(target=worker, daemon=True).start()
+        self.show_spinner()
+        self.tmpdir = pe.make_extract_dir(self.tmpdir)
+        self.worker = ExtractWorker(pdf_path, self.tmpdir)
+        self.worker.finished_ok.connect(self.on_extract_finished)
+        self.worker.no_images.connect(self.on_no_images)
+        self.worker.error.connect(self.on_extract_error)
+        self.worker.start()
 
-    def select_all():
-        suppress_traces['value'] = True
-        for img in img_files_with_meta:
-            if 'select_var' not in img:
-                img['select_var'] = tk.BooleanVar(value=True)
-            img['select_var'].set(True)
-        suppress_traces['value'] = False
-        for img in img_files_with_meta:
-            if 'check_canvas' in img:
-                draw_check_checkbox = img['draw_check_checkbox']
-                draw_check_checkbox(img['check_canvas'], True)
+    def show_spinner(self):
+        self.spinner_movie = QMovie(SPINNER_PATH)
+        self.spinner_label.setMovie(self.spinner_movie)
+        self.spinner_movie.start()
+        self.stack.setCurrentIndex(2)
 
-    def select_none():
-        suppress_traces['value'] = True
-        for img in img_files_with_meta:
-            if 'select_var' not in img:
-                img['select_var'] = tk.BooleanVar(value=True)
-            img['select_var'].set(False)
-        suppress_traces['value'] = False
-        for img in img_files_with_meta:
-            if 'check_canvas' in img:
-                draw_check_checkbox = img['draw_check_checkbox']
-                draw_check_checkbox(img['check_canvas'], False)
+    def hide_spinner(self):
+        if self.spinner_movie:
+            self.spinner_movie.stop()
+            self.spinner_movie = None
 
-    def save_selected():
-        if not tmpdir or not os.path.exists(tmpdir):
-            messagebox.showerror('No Images', 'No images to save. Please open a PDF first.', parent=root)
+    def _return_to_prior_page(self):
+        self.stack.setCurrentIndex(1 if self.images else 0)
+
+    def on_no_images(self):
+        self.hide_spinner()
+        self._return_to_prior_page()
+        QMessageBox.information(self, 'No Images', 'No images found in PDF.')
+
+    def on_extract_error(self, message):
+        self.hide_spinner()
+        self._return_to_prior_page()
+        QMessageBox.critical(self, 'Extraction Error', message)
+
+    def on_extract_finished(self, images):
+        self.hide_spinner()
+        self.images = images
+        self.render_grid()
+        self.stack.setCurrentIndex(1)
+
+    # --- Grid rendering ---
+    def clear_grid(self):
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def render_grid(self):
+        self.theme_colors = self._compute_theme_colors()
+        self.clear_grid()
+        page_counter = {}
+        last_row = 0
+        for idx, img in enumerate(self.images):
+            row = idx // GRID_COLS
+            col = idx % GRID_COLS
+            cell = self._build_cell(img, page_counter)
+            self.grid_layout.addWidget(cell, row, col, Qt.AlignmentFlag.AlignTop)
+            last_row = row
+        # Soak up leftover vertical space in a phantom row so cards stay
+        # compact at the top instead of stretching to fill the scroll area.
+        self.grid_layout.setRowStretch(last_row + 1, 1)
+
+    def _build_cell(self, img, page_counter):
+        meta = img['meta']
+        pg = meta.get('page', '?')
+        pg_str = f"{int(pg):03}" if isinstance(pg, int) else str(pg)
+        page_counter[pg_str] = page_counter.get(pg_str, 0) + 1
+        idx_str = f"{page_counter[pg_str]:02}"
+        if not img.get('save_name'):
+            img['save_name'] = f"pg{pg_str}-{idx_str}"
+        img['selected'] = True
+
+        card = QFrame()
+        card.setObjectName('imageCard')
+        v = QVBoxLayout(card)
+        v.setContentsMargins(10, 10, 10, 8)
+        v.setSpacing(6)
+
+        thumb_path = img['thumb_path'] if os.path.exists(img['thumb_path']) else img['orig_path']
+        pil_thumb = Image.open(thumb_path)
+        pil_thumb.thumbnail((THUMB_SIZE, THUMB_SIZE))
+        thumb_label = ClickableLabel()
+        thumb_label.setPixmap(pil_to_pixmap(pil_thumb))
+        thumb_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
+        thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb_label.clicked.connect(lambda img=img: self.toggle_selected(img))
+        v.addWidget(thumb_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        img['_thumb_label'] = thumb_label
+
+        name_label = QLabel(img['save_name'])
+        name_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        name_label.setStyleSheet(f"color: {self.theme_colors['text']};")
+        v.addWidget(name_label)
+        img['_name_label'] = name_label
+
+        btn_row = QWidget()
+        btn_layout = QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(4)
+
+        zoom_btn = self._make_icon_button('\U0001F50D', 'View full size', self.theme_colors['text'])
+        zoom_btn.clicked.connect(lambda _, img=img: self.show_full_res(img))
+        rename_btn = self._make_icon_button('✎', 'Rename', self.theme_colors['text'])
+        rename_btn.clicked.connect(lambda _, img=img: self.rename_image(img))
+        rotate_btn = self._make_icon_button('↻', 'Rotate', self.theme_colors['text'])
+        rotate_btn.clicked.connect(lambda _, img=img: self.rotate_image(img))
+        btn_layout.addWidget(zoom_btn)
+        btn_layout.addWidget(rename_btn)
+        btn_layout.addWidget(rotate_btn)
+        v.addWidget(btn_row, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        dims_label = QLabel(f"{meta.get('width', '?')} x {meta.get('height', '?')}")
+        dims_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        dims_label.setStyleSheet(f"color: {self.theme_colors['secondary_text']};")
+        v.addWidget(dims_label)
+        img['_dims_label'] = dims_label
+
+        img['_card'] = card
+        self._apply_card_style(img)
+
+        return card
+
+    def _make_icon_button(self, glyph, tooltip, color):
+        btn = QPushButton(glyph)
+        btn.setFixedSize(28, 28)
+        btn.setToolTip(tooltip)
+        btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn.setStyleSheet(
+            f'QPushButton {{ border: none; background: transparent; color: {color}; font-size: 14px; border-radius: 4px; }}'
+            'QPushButton:hover { background: rgba(127, 127, 127, 0.25); }'
+        )
+        return btn
+
+    def _apply_card_style(self, img):
+        card = img.get('_card')
+        if not card:
             return
-        kept = 0
-        export_fmt = export_format_var.get().upper()
-        page_img_counter = {}
-        outdir = filedialog.askdirectory(title='Select output folder', parent=root)
+        c = self.theme_colors
+        if img.get('selected', True):
+            card.setStyleSheet(
+                f"#imageCard {{ border: 2px solid {c['selected_border']}; background: {c['selected_bg']}; border-radius: 8px; }}"
+            )
+        else:
+            card.setStyleSheet(
+                f"#imageCard {{ border: 1px solid {c['unselected_border']}; background: {c['unselected_bg']}; border-radius: 8px; }}"
+            )
+
+    def toggle_selected(self, img):
+        img['selected'] = not img.get('selected', True)
+        self._apply_card_style(img)
+
+    def select_all(self):
+        for img in self.images:
+            img['selected'] = True
+            self._apply_card_style(img)
+
+    def select_none(self):
+        for img in self.images:
+            img['selected'] = False
+            self._apply_card_style(img)
+
+    def rename_image(self, img):
+        new_name, ok = QInputDialog.getText(self, 'Rename Image', 'File name:', text=img['save_name'])
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if new_name:
+            img['save_name'] = new_name
+            img['_name_label'].setText(new_name)
+
+    def rotate_image(self, img):
+        try:
+            with Image.open(img['orig_path']) as im:
+                rotated = im.transpose(Image.Transpose.ROTATE_270)  # visually clockwise
+                rotated.save(img['orig_path'])
+            with Image.open(img['orig_path']) as im:
+                trimmed = pe.trim_whitespace(im)
+                thumb = trimmed.copy()
+            thumb.thumbnail((THUMB_SIZE, THUMB_SIZE))
+            thumb.save(img['thumb_path'], 'PNG')
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'Could not rotate image: {e}')
+            return
+
+        meta = img['meta']
+        w, h = meta.get('width'), meta.get('height')
+        if isinstance(w, int) and isinstance(h, int):
+            meta['width'], meta['height'] = h, w
+            img['_dims_label'].setText(f"{h} x {w}")
+
+        img['_thumb_label'].setPixmap(pil_to_pixmap(thumb))
+
+    def show_full_res(self, img):
+        orig_path = img['orig_path']
+        if not os.path.exists(orig_path):
+            QMessageBox.critical(self, 'Error', 'Image file not found.')
+            return
+        dlg = FullImageDialog(self, orig_path, img['meta'], img['filename'])
+        dlg.exec()
+
+    # --- Saving ---
+    def save_selected(self):
+        if not self.tmpdir or not os.path.exists(self.tmpdir):
+            QMessageBox.critical(self, 'No Images', 'No images to save. Please open a PDF first.')
+            return
+        selected = [img for img in self.images if img.get('selected', True)]
+        if not selected:
+            QMessageBox.information(self, 'No Selection', 'No images selected.')
+            return
+        outdir = QFileDialog.getExistingDirectory(self, 'Select output folder')
         if not outdir:
             return
-        for img in img_files_with_meta:
-            var = img.get('select_var')
-            if var and var.get():
-                img_file = img['filename']
-                meta = img['meta']
-                pg = meta.get('page', '?')
-                pg_str = f"{int(pg):03}" if isinstance(pg, int) or (isinstance(pg, str) and str(pg).isdigit()) else str(pg)
-                if pg_str not in page_img_counter:
-                    page_img_counter[pg_str] = 1
-                else:
-                    page_img_counter[pg_str] += 1
-                per_page_idx = page_img_counter[pg_str]
-                idx_str = f"{per_page_idx:02}"
-                out_name = f"pg{pg_str}-{idx_str}.{export_fmt.lower()}"
-                full_img_path = os.path.join(tmpdir, img_file) if tmpdir else None
-                if not full_img_path or not os.path.exists(full_img_path):
-                    continue
-                pil_img = Image.open(full_img_path)
-                out_path = os.path.join(outdir, out_name)
-                pil_img.save(out_path, export_fmt)
-                kept += 1
-        messagebox.showinfo('Done', f'Saved {kept} images to {outdir}', parent=root)
-        render_images()
-
-
-    # --- Toolbar and controls ---
-    toolbar = ttk.Frame(root)
-    toolbar.pack(side='top', fill='x')
-
-    # --- Toolbar layout: [Open PDF] {flex} [Select All] [Select None] {flex} O PNG O WEBP [Save Selected] ---
-    checks = []
-    export_format_var = tk.StringVar(value='PNG')
-    toolbar.grid_columnconfigure(0, weight=0)
-    toolbar.grid_columnconfigure(1, weight=1)
-    toolbar.grid_columnconfigure(2, weight=0)
-    toolbar.grid_columnconfigure(3, weight=0)
-    toolbar.grid_columnconfigure(4, weight=1)
-    toolbar.grid_columnconfigure(5, weight=0)
-    toolbar.grid_columnconfigure(6, weight=0)
-    btn_open = tk.Button(toolbar, text='📂 Open PDF', bg='#bbdefb', fg='black', activebackground='#1976d2', activeforeground='white', command=open_pdf)
-    btn_open.grid(row=0, column=0, padx=(8, 0), pady=5, sticky='w')
-    btn_all = ttk.Button(toolbar, text='Select All', command=select_all)
-    btn_all.grid(row=0, column=2, padx=(0, 2), pady=5)
-    btn_none = ttk.Button(toolbar, text='Select None', command=select_none)
-    btn_none.grid(row=0, column=3, padx=(2, 0), pady=5)
-    format_controls = ttk.Frame(toolbar)
-    rb_png = ttk.Radiobutton(format_controls, text='PNG', variable=export_format_var, value='PNG', width=5)
-    rb_webp = ttk.Radiobutton(format_controls, text='WEBP', variable=export_format_var, value='WEBP', width=5)
-    rb_png.pack(side='left', padx=(0,1), pady=5)
-    rb_webp.pack(side='left', padx=(1,0), pady=5)
-    format_controls.grid(row=0, column=5, padx=(0, 0), pady=5)
-    btn_save = tk.Button(toolbar, text='💾 Save Selected', bg='#43a047', fg='black', activebackground='#a5d6a7', activeforeground='black', command=save_selected)
-    btn_save.grid(row=0, column=6, padx=(8, 12), pady=5, sticky='e')
-
-    # --- Placeholder for image state ---
-    img_files_with_meta = []
-    tmpdir = None
-
-    # --- Canvas and image grid ---
-    container = ttk.Frame(root)
-    container.pack(side='top', fill='both', expand=True)
-    canvas = tk.Canvas(container, highlightthickness=0)
-    vsb = ttk.Scrollbar(container, orient='vertical', command=canvas.yview)
-    canvas.configure(yscrollcommand=vsb.set)
-    vsb.pack(side='right', fill='y')
-    canvas.pack(side='left', fill='both', expand=True)
-    frame = ttk.Frame(canvas)
-    frame_id = canvas.create_window((0,0), window=frame, anchor='nw')
-    # Update scrollregion to the bounding box of the frame window, not 'all'
-    def update_scrollregion(event=None):
-        bbox = canvas.bbox(frame_id)
-        if bbox:
-            canvas.config(scrollregion=bbox)
-    frame.bind('<Configure>', update_scrollregion)
-    canvas.bind('<Configure>', lambda e: canvas.itemconfig(frame_id))
-    thumbs = []
-    thumb_size = 160
-
-    # --- Batch selection optimization ---
-    suppress_traces = {'value': False}  # Mutable container for closure
-
-
-    # Prompt for PDF on startup, but after main window is visible and centered
-    def prompt_pdf_after_window_shown():
-        # Wait for the window to be fully drawn and centered
-        root.update_idletasks()
-        root.deiconify()  # Ensure window is shown
-        root.lift()
-        root.after(150, open_pdf)  # Give a short delay for window manager to show
-
-    # Hide window until ready to show (prevents off-screen dialog)
-    root.withdraw()
-    root.after(50, lambda: root.deiconify())
-    root.after(100, prompt_pdf_after_window_shown)
-
-
-    # --- Render images grid ---
-    def render_images():
-        print('[DEBUG] render_images: start, img_files_with_meta:', len(img_files_with_meta))
-        print('[DEBUG] img_files_with_meta:', img_files_with_meta)
-        for widget in frame.winfo_children():
-            widget.destroy()
-        thumbs.clear()
-        checks.clear()
-        print('[DEBUG] render_images: cleared widgets and thumbs')
-        frame.update_idletasks()
-        n_imgs = len(img_files_with_meta)
-        cols = 4
-        pad_y = 18
-        pad_x = 24
-        thumb_w = thumb_size
-
-        # --- Click to show full-res image ---
-        def show_full_res(event, orig_path=None, meta=None, img_file=None):
-            if not orig_path or not os.path.exists(orig_path):
-                messagebox.showerror('Error', f'Image file not found.', parent=root)
-                return
-            if not meta:
-                meta = {}
-            try:
-                top = tk.Toplevel(root)
-                top.title(f"Full Image: {img_file if img_file else ''}")
-                root.update_idletasks()
-                x = root.winfo_rootx() + (root.winfo_width() // 2) - 400
-                y = root.winfo_rooty() + (root.winfo_height() // 2) - 300
-                top.geometry(f"800x600+{x}+{y}")
-                top.transient(root)
-                top.grab_set()
-                # Scrollable canvas for large images
-                canvas = tk.Canvas(top, highlightthickness=0)
-                hsb = ttk.Scrollbar(top, orient='horizontal', command=canvas.xview)
-                vsb = ttk.Scrollbar(top, orient='vertical', command=canvas.yview)
-                canvas.configure(xscrollcommand=hsb.set, yscrollcommand=vsb.set)
-                canvas.pack(side='left', fill='both', expand=True)
-                vsb.pack(side='right', fill='y')
-                hsb.pack(side='bottom', fill='x')
-                pil_full = Image.open(orig_path)
-                img_w, img_h = pil_full.size
-                # Resize if too large for screen
-                screen_w = root.winfo_screenwidth()
-                screen_h = root.winfo_screenheight()
-                max_w = min(1600, screen_w - 100)
-                max_h = min(1200, screen_h - 100)
-                scale = min(1.0, max_w / img_w, max_h / img_h)
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = getattr(Image, 'LANCZOS', getattr(Image, 'BICUBIC', 0))
-                if scale < 1.0:
-                    pil_disp = pil_full.resize((int(img_w*scale), int(img_h*scale)), resample)
-                else:
-                    pil_disp = pil_full
-
-                # Center image in canvas
-                canvas.update_idletasks()
-                c_w = canvas.winfo_width() or 800
-                c_h = canvas.winfo_height() or 600
-                x0 = max((c_w - pil_disp.width) // 2, 0)
-                y0 = max((c_h - pil_disp.height) // 2, 0)
-                full_img = ImageTk.PhotoImage(pil_disp, master=top)
-                img_id = canvas.create_image(x0, y0, anchor='nw', image=full_img)
-                canvas.config(scrollregion=(0, 0, pil_disp.width, pil_disp.height))
-
-                # Store image reference
-                if not hasattr(show_full_res, '_img_refs'):
-                    show_full_res._img_refs = []
-                show_full_res._img_refs.append(full_img)
-
-                # Show meta info at top
-                meta_str = f"{img_file if img_file else ''} | {meta.get('width', '?')} x {meta.get('height', '?')}"
-                label = ttk.Label(top, text=meta_str, background='#222', foreground='#fff', anchor='w')
-                label.place(x=0, y=0, relwidth=1)
-                
-                # Center image on resize
-                def center_image(event=None):
-                    c_w = canvas.winfo_width()
-                    c_h = canvas.winfo_height()
-                    x0 = max((c_w - pil_disp.width) // 2, 0)
-                    y0 = max((c_h - pil_disp.height) // 2, 0)
-                    canvas.coords(img_id, x0, y0)
-                canvas.bind('<Configure>', center_image)
-
-                # Close on Escape
-                top.bind('<Escape>', lambda e: top.destroy())
-            except Exception as e:
-                messagebox.showerror('Error', f'Could not open image: {e}', parent=root)
-        # --- End click ---
-
-        page_img_counter = {}
-        for idx, img in enumerate(img_files_with_meta):
-            print(f'[DEBUG] Drawing image {idx}:', img)
-            row = idx // cols
-            col = idx % cols
-            img_file = img['filename']
-            meta = img['meta']
-            orig_path = img['orig_path']
-            thumb_path = img.get('thumb_path')
-            if 'select_var' not in img:
-                img['select_var'] = tk.BooleanVar(value=True)
-            checks.append(img['select_var'])
-            display_path = thumb_path if thumb_path and os.path.exists(thumb_path) else orig_path
-            pil_img = Image.open(display_path)
-            pil_img.thumbnail((thumb_size, thumb_size))
-
-            # No compositing: let transparency be handled by default (may show as white or system default)
-            thumb = ImageTk.PhotoImage(pil_img, master=root)
-            thumbs.append(thumb)
-
-            # Use tk.Label for thumbnail, no border/highlight, default bg
-            panel = tk.Label(frame, image=thumb, borderwidth=0, relief='flat')
-            panel.grid(row=row*2, column=col, padx=pad_x, pady=pad_y, sticky='ns')
-            
-            # --- Make thumbnail look clickable: change cursor on hover ---
-            def on_enter(e, panel=panel):
-                panel.config(cursor='hand2')
-            def on_leave(e, panel=panel):
-                panel.config(cursor='')
-            panel.bind('<Enter>', on_enter)
-            panel.bind('<Leave>', on_leave)
-            # --- End clickable style ---
-
-            panel.bind('<Button-1>', lambda event, orig_path=orig_path, meta=meta, img_file=img_file: show_full_res(event, orig_path, meta, img_file))
-            # --- End click ---
-            pg = meta.get('page', '?') if meta else '?'
-            width = meta.get('width', '?') if meta else '?'
-            height = meta.get('height', '?') if meta else '?'
-            pg_str = f"{int(pg):03}" if (isinstance(pg, int) or (isinstance(pg, str) and str(pg).isdigit())) else str(pg)
-            if pg_str not in page_img_counter:
-                page_img_counter[pg_str] = 1
+        export_fmt = 'WEBP' if self.rb_webp.isChecked() else 'PNG'
+        kept = 0
+        name_counts = {}
+        for img in selected:
+            base_name = img.get('save_name') or img['filename']
+            name = base_name
+            if name in name_counts:
+                name_counts[name] += 1
+                name = f"{base_name}-{name_counts[base_name]}"
             else:
-                page_img_counter[pg_str] += 1
-            per_page_idx = page_img_counter[pg_str]
-            idx_str = f"{per_page_idx:02}"
-            meta_frame = ttk.Frame(frame)
-            meta_frame.grid(row=row*2+1, column=col, sticky='n')
+                name_counts[name] = 0
+            out_path = os.path.join(outdir, f"{name}.{export_fmt.lower()}")
+            try:
+                with Image.open(img['orig_path']) as pil_img:
+                    pil_img.save(out_path, export_fmt)
+                kept += 1
+            except Exception as e:
+                print(f"[WARN] Failed to save {img['orig_path']}: {e}")
+        QMessageBox.information(self, 'Done', f'Saved {kept} images to {outdir}')
 
-            # --- Top group: file name entry and checkbox, centered ---
-            top_group = ttk.Frame(meta_frame)
-            top_group.pack(side='top', anchor='n', pady=(0,0), fill='x')
-            entry_width = round(18 * 2 / 3)
-            default_name = img.get('save_name') or f"pg{pg_str}-{idx_str}"
-            if 'save_name' not in img:
-                img['save_name'] = default_name
-            entry = ttk.Entry(top_group, width=entry_width)
-            entry.insert(0, img['save_name'])
+    def closeEvent(self, event):
+        if self.tmpdir and os.path.exists(self.tmpdir):
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+        super().closeEvent(event)
 
-            # Set background to match checkbox background
-            entry.configure(background='#f5f5f5')
-            entry.pack(side='left', anchor='n', padx=(0, 0), pady=(0,0))
 
-            def update_save_name(event=None, img=img, entry=entry):
-                val = entry.get().strip()
-                if val:
-                    img['save_name'] = val
-            entry.bind('<FocusOut>', update_save_name)
-            entry.bind('<Return>', update_save_name)
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
-            def draw_check_checkbox(canvas, checked):
-                try:
-                    canvas.delete('all')
-                    if checked:
-                        canvas.create_text(10, 10, text='✔️', font=('Arial', 10), anchor='center')
-                except tk.TclError:
-                    pass
-
-            check_checkbox = tk.Canvas(top_group, width=20, height=20, highlightthickness=0, bd=0, relief='flat', bg='#f5f5f5')
-
-            # Use pady=(2,0) to nudge the checkbox down for top alignment with entry
-            check_checkbox.pack(side='left', anchor='n', padx=(12,0), pady=(2,0))
-
-            def update_check_checkbox(*args, canvas=check_checkbox, v=img['select_var']):
-                if not suppress_traces['value']:
-                    draw_check_checkbox(canvas, v.get())
-            img['select_var'].trace_add('write', update_check_checkbox)
-            check_checkbox.bind('<Button-1>', lambda e, v=img['select_var']: v.set(not v.get()))
-            draw_check_checkbox(check_checkbox, img['select_var'].get())
-            img['check_canvas'] = check_checkbox
-            img['draw_check_checkbox'] = draw_check_checkbox
-
-            # --- Dimensions label below, centered ---
-            dim_str = f"{width} x {height}"
-            label2 = ttk.Label(meta_frame, text=dim_str, anchor='center', justify='center')
-            label2.pack(side='top', anchor='center', pady=(2,0))
-
-        frame.update_idletasks()
-        canvas.update_idletasks()
-        root.update_idletasks()
-        # Update scrollregion to the bounding box of the frame window (not 'all')
-        bbox = canvas.bbox(frame_id)
-        print('[DEBUG] render_images: done')
-        print('[DEBUG] frame children after render:', frame.winfo_children())
-        print('[DEBUG] canvas bbox (frame_id):', bbox)
-        if bbox:
-            canvas.config(scrollregion=bbox)
-
-    root.mainloop() 
 
 if __name__ == '__main__':
     main()
